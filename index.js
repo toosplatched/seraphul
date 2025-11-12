@@ -3,7 +3,7 @@ const FormData = require("form-data");
 const { MAIN_KEYS } = require("./geminikey.js");
 require("dotenv").config();
 
-const MW_API = "https://superstarracers.wiki/w/api.php";
+const MW_API = peocess.env.MW_API;
 const USERNAME = process.env.BOTUSERNAME;
 const PASSWORD = process.env.BOTPASSWORD;
 
