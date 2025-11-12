@@ -1,4 +1,3 @@
-const fetch = require("node-fetch");
 const FormData = require("form-data");
 const { MAIN_KEYS } = require("./geminikey.js");
 require("dotenv").config();
@@ -7,137 +6,176 @@ const MW_API = process.env.MW_API;
 const USERNAME = process.env.BOTUSERNAME;
 const PASSWORD = process.env.BOTPASSWORD;
 
-// -------------------- DYNAMIC IMPORT (ESM-ONLY GEMINI) --------------------
+// -------------------- DYNAMIC IMPORT FOR GEMINI CLIENT --------------------
 let GoogleGenAI;
 async function getGeminiClient(apiKey) {
-	if (!GoogleGenAI) {
-		const mod = await import("@google/genai");
-		GoogleGenAI = mod.GoogleGenAI;
-	}
-	return new GoogleGenAI({ apiKey });
+  if (!GoogleGenAI) {
+    const mod = await import('@google/genai');
+    GoogleGenAI = mod.GoogleGenAI;
+  }
+  return new GoogleGenAI({ apiKey });
 }
 
-// -------------------- GEMINI REQUEST HANDLER (MULTI-KEY SUPPORT) --------------------
+// -------------------- MULTI-KEY HANDLING FOR GEMINI --------------------
 async function runWithMainKeys(fn) {
-	const keys = Array.isArray(MAIN_KEYS) ? MAIN_KEYS : [MAIN_KEYS];
-	if (!keys.length) throw new Error("No Gemini main keys set!");
+  const keysArray = Array.isArray(MAIN_KEYS) ? MAIN_KEYS : [MAIN_KEYS];
+  if (keysArray.length === 0) throw new Error('No Gemini keys provided');
 
-	let lastErr;
-	for (const key of keys) {
-		try {
-			const gemini = await getGeminiClient(key);
-			return await fn(gemini);
-		} catch (err) {
-			const msg = err?.message || err?.toString();
-			console.error(`Gemini request failed with key ${key.slice(0, 15)}...:`, msg);
-
-			// skip over quota or transient errors
-			if (msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429") || msg.includes("503")) {
-				lastErr = err;
-				continue;
-			}
-			throw err;
-		}
-	}
-	throw lastErr || new Error("All Gemini main keys failed!");
+  let lastErr;
+  for (const key of keysArray) {
+    try {
+      const client = await getGeminiClient(key);
+      return await fn(client);
+    } catch (err) {
+      const msg = err?.message || err.toString();
+      console.error(`Gemini key ${key.slice(0,15)}… failed:`, msg);
+      // If rate-limit or service unavailable, try next key
+      if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429') || msg.includes('503')) {
+        lastErr = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new Error('All Gemini keys failed');
 }
 
-// -------------------- MEDIAWIKI LOGIN --------------------
-async function login() {
-	// Step 1: Get login token
-	let res = await fetch(`${MW_API}?action=query&meta=tokens&type=login&format=json`);
-	let data = await res.json();
-	const loginToken = data.query.tokens.logintoken;
+ 
+// -------------------- MEDIAWIKI LOGIN (returns cookieHeader + csrfToken) --------------------
 
-	// Step 2: Log in
-	const form = new FormData();
-	form.append("action", "login");
-	form.append("lgname", USERNAME);
-	form.append("lgpassword", PASSWORD);
-	form.append("lgtoken", loginToken);
-	form.append("format", "json");
+async function loginToWiki() {
+    // === STEP 1: Get login token ===
+    const tokenRes = await fetch(`${MW_API}?action=query&meta=tokens&type=login&format=json`);
+    const tokenData = await tokenRes.json();
+    const loginToken = tokenData?.query?.tokens?.logintoken;
+    if (!loginToken) throw new Error("Failed to get login token");
 
-	const cookieJar = [];
-	res = await fetch(MW_API, { method: "POST", body: form, redirect: "manual" });
-	const setCookie = res.headers.raw()["set-cookie"];
-	if (setCookie) cookieJar.push(...setCookie.map((c) => c.split(";")[0]));
-	const cookies = cookieJar.join("; ");
+    // collect cookies from step 1
+    const initialCookies = [];
+    tokenRes.headers.forEach((val, key) => {
+        if (key.toLowerCase() === "set-cookie") initialCookies.push(val);
+    });
+    const initialCookieHeader = initialCookies.join("; ");
 
-	console.log("✅ Logged in as", USERNAME);
+    // === STEP 2: Log in ===
+    const formData = new URLSearchParams();
+    formData.append("action", "login");
+    formData.append("lgname", USERNAME);
+    formData.append("lgpassword", PASSWORD);
+    formData.append("lgtoken", loginToken);
+    formData.append("format", "json");
 
-	// Step 3: Get CSRF token
-	res = await fetch(`${MW_API}?action=query&meta=tokens&format=json`, {
-		headers: { Cookie: cookies },
-	});
-	data = await res.json();
-	const csrfToken = data.query.tokens.csrftoken;
+    const loginRes = await fetch(MW_API, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": initialCookieHeader
+        },
+        body: formData
+    });
 
-	return { cookies, csrfToken };
+    // collect *all* cookies after login
+    const allCookies = [...initialCookies];
+    loginRes.headers.forEach((val, key) => {
+        if (key.toLowerCase() === "set-cookie") allCookies.push(val);
+    });
+    const cookieHeader = allCookies.join("; ");
+
+    const loginData = await loginRes.json();
+    if (loginData?.login?.result !== "Success") {
+        console.error("Login failed:", loginData);
+        throw new Error("Login failed: " + loginData?.login?.result);
+    }
+
+    console.log(`✅ Logged in as ${USERNAME}`);
+  
+    // === STEP 3: Get CSRF token ===
+    const csrfRes = await fetch(`${MW_API}?action=query&meta=tokens&type=csrf&format=json`, {
+        headers: { Cookie: cookieHeader }
+    });
+    const csrfData = await csrfRes.json();
+    const csrfToken = csrfData?.query?.tokens?.csrftoken;
+    if (!csrfToken) throw new Error("Failed to get CSRF token");
+
+    console.log("🔑 Got CSRF token");
+
+    return { cookieHeader, csrfToken };
 }
 
-// -------------------- FETCH FILE LIST --------------------
-async function getFileList(cookies) {
-	const res = await fetch(`${MW_API}?action=query&list=allimages&ailimit=50&format=json`, {
-		headers: { Cookie: cookies },
-	});
-	const data = await res.json();
-	return data.query.allimages.map((f) => f.name);
+// -------------------- GET FILE LIST --------------------
+async function getFileList(cookieHeader) {
+  const res = await fetch(`${MW_API}?action=query&list=allimages&ailimit=50&format=json`, {
+    headers: { Cookie: cookieHeader }
+  });
+  const json = await res.json();
+  if (!json?.query?.allimages) {
+    console.warn('No images returned or unexpected format', json);
+    return [];
+  }
+  return json.query.allimages.map(f => f.name);
 }
 
 // -------------------- DELETE FILE --------------------
-async function deleteFile(fileName, csrfToken, cookies) {
-	const form = new FormData();
-	form.append("action", "delete");
-	form.append("title", "File:" + fileName);
-	form.append("reason", "Non-descriptive filename (auto-detected by Gemini)");
-	form.append("token", csrfToken);
-	form.append("format", "json");
+async function deleteFile(fileName, csrfToken, cookieHeader) {
+  const formData = new URLSearchParams();
+  formData.append('action','delete');
+  formData.append('title', `File:${fileName}`);
+  formData.append('reason', 'Non-descriptive filename (auto-detected by Gemini)');
+  formData.append('token', csrfToken);
+  formData.append('format','json');
 
-	const res = await fetch(MW_API, {
-		method: "POST",
-		headers: { Cookie: cookies },
-		body: form,
-	});
-
-	const data = await res.json();
-	if (data.error) {
-		console.error("⚠️ Failed to delete", fileName, data.error.info);
-	} else {
-		console.log("🗑️ Deleted", fileName);
-	}
+  const res = await fetch(MW_API, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Cookie: cookieHeader
+    },
+    body: formData
+  });
+  const json = await res.json();
+  if (json.error) {
+    console.error('⚠️ Failed to delete', fileName, json.error.info);
+  } else {
+    console.log('🗑️ Deleted:', fileName);
+  }
 }
 
-// -------------------- GEMINI FILENAME CHECK --------------------
-async function isNonDescriptive(name) {
-	return await runWithMainKeys(async (gemini) => {
-		const prompt = `Is this filename non-descriptive or autogenerated? 
-Only reply with "yes" if it's a generic, gibberish, or camera-style name 
-like "Screenshot 2025-11-11.png" or "IMG_2345.jpg".
-Filename: ${name}`;
+// -------------------- CHECK FILENAME USING GEMINI --------------------
+async function isNonDescriptive(fileName) {
+  return await runWithMainKeys(async (gemini) => {
+    const prompt = `Is this filename non-descriptive or autogenerated? Only reply with "yes" if it's a generic, gibberish, or camera-style name like "Screenshot 2025-11-11.png" or "IMG_2345.jpg". Filename: ${fileName}`;
 
-		const result = await gemini.models.generateContent({
-			model: "gemini-2.5-flash",
-			contents: [{ role: "user", parts: [{ text: prompt }] }],
-			maxOutputTokens: 50,
-		});
+    const response = await gemini.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      maxOutputTokens: 50
+    });
 
-		const text = result.response.candidates?.[0]?.content?.parts?.[0]?.text?.toLowerCase() || "";
-		return text.includes("yes");
-	});
+    // extract the text
+    const text = response?.candidates?.[0]?.content?.parts?.[0]?.text?.toLowerCase() || '';
+    return text.includes('yes');
+  });
 }
 
-// -------------------- MAIN --------------------
+ 
+// -------------------- MAIN EXECUTION --------------------
 (async () => {
-	const { cookies, csrfToken } = await login();
-	const files = await getFileList(cookies);
+  try {
+    const { cookieHeader, csrfToken } = await loginToWiki();
+    const files = await getFileList(cookieHeader);
 
-	for (const file of files) {
-		const bad = await isNonDescriptive(file);
-		if (bad) {
-			console.log("❌ Non-descriptive:", file);
-			await deleteFile(file, csrfToken, cookies);
-		} else {
-			console.log("✅ Descriptive:", file);
-		}
-	}
+    for (const file of files) {
+      const bad = await isNonDescriptive(file);
+      if (bad) {
+        console.log('❌ Non-descriptive:', file);
+        await deleteFile(file, csrfToken, cookieHeader);
+      } else {
+        console.log('✅ Descriptive:', file);
+      }
+    }
+
+    console.log('✅ Finished processing all files');
+  } catch (err) {
+    console.error('Fatal error:', err);
+  }
 })();
