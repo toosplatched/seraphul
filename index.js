@@ -1,6 +1,7 @@
 const fetch = require("node-fetch");
 const FormData = require("form-data");
 const { MAIN_KEYS } = require("./geminikey.js");
+require("dotenv").config();
 
 const MW_API = "https://superstarracers.wiki/w/api.php";
 const USERNAME = process.env.BOTUSERNAME;
